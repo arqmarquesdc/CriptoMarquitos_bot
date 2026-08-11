@@ -1,0 +1,43 @@
+# Corre el bot cada 4 horas (poco después del cierre de cada vela H4 en UTC:
+# 00:05, 04:05, 08:05, 12:05, 16:05, 20:05) usando GitHub Actions, que es
+# gratuito para repos públicos (y tiene minutos gratis de sobra para esto
+# incluso en repos privados).
+
+name: Alertas BTC H4
+
+on:
+  schedule:
+    - cron: "5 0,4,8,12,16,20 * * *"
+  workflow_dispatch: {}  # permite correrlo manualmente desde la pestaña Actions
+
+permissions:
+  contents: write  # necesario para que el workflow pueda commitear el state.json
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot_btc_h4.py
+
+      - name: Guardar estado (evita alertas duplicadas)
+        run: |
+          git config user.name "btc-alert-bot"
+          git config user.email "btc-alert-bot@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Actualiza estado de alertas [skip ci]"
+          git push

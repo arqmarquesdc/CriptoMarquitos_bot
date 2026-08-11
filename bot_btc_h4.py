@@ -326,12 +326,25 @@ def run_once():
     save_state(state)
 
 
+def test_telegram():
+    """Manda un mensaje de prueba, sin depender de que haya una señal real. Sirve
+    para verificar que el token/chat_id están bien configurados."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    send_telegram_message(
+        f"✅ *Test de conexión* — el bot de alertas BTC (H4/M15) está andando bien.\n"
+        f"Hora: {ts}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", action="store_true", help="Correr en loop continuo (revisa cada 1 min)")
+    parser.add_argument("--test-telegram", action="store_true", help="Manda un mensaje de prueba y sale, sin chequear señales")
     args = parser.parse_args()
 
-    if args.loop:
+    if args.test_telegram:
+        test_telegram()
+    elif args.loop:
         print("Bot corriendo en loop. Ctrl+C para detener.")
         while True:
             try:

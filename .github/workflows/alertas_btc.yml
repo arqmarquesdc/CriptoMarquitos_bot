@@ -1,13 +1,16 @@
-# Corre el bot cada 4 horas (poco después del cierre de cada vela H4 en UTC:
-# 00:05, 04:05, 08:05, 12:05, 16:05, 20:05) usando GitHub Actions, que es
-# gratuito para repos públicos (y tiene minutos gratis de sobra para esto
-# incluso en repos privados).
+# Corre el bot cada 15 minutos usando GitHub Actions (gratis). En cada corrida
+# el script chequea tanto H4 como M15 y solo manda alerta si hay un cruce
+# fresco de EMA en la vela recién cerrada de cada temporalidad.
+#
+# Nota: GitHub no garantiza precisión exacta en los cron schedules (puede
+# demorar unos minutos en horarios de mucha carga), pero para esta estrategia
+# no es un problema: igual detecta el cruce en cuanto corre.
 
-name: Alertas BTC H4
+name: Alertas BTC H4 + M15
 
 on:
   schedule:
-    - cron: "5 0,4,8,12,16,20 * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}  # permite correrlo manualmente desde la pestaña Actions
 
 permissions:

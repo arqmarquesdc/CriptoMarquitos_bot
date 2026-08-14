@@ -572,7 +572,13 @@ def is_bias_invalidated(pending, h4_candles):
         if direction == "SELL" and crossed_up:
             return True, "apareció un cruce EMA alcista en H4 (la lectura de fondo cambió)"
 
-    age_hours = (last["close_time"] - pending["h4_close_time"]) / (3600 * 1000)
+    # Ojo: usar el reloj real (no el close_time de la última vela H4 disponible).
+    # Esa última vela solo avanza de a bloques de 4h, así que compararse contra
+    # ella puede retrasar el backstop hasta el doble del límite configurado si
+    # justo coincide con el borde de una vela (bug detectado en producción:
+    # idea pendiente seguía activa a las 5.7h en vez de cortarse a las 4h).
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    age_hours = (now_ms - pending["h4_close_time"]) / (3600 * 1000)
     if age_hours > PENDING_MAX_HOURS:
         return True, f"pasaron más de {PENDING_MAX_HOURS}h sin confirmación (backstop de seguridad)"
 

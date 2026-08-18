@@ -1,17 +1,35 @@
 """
 Bot de alertas de compra/venta de Bitcoin (BTC/USD).
 
-Capa de trading (plazo más largo): el sesgo direccional y los niveles de
-entrada/stop/take profit salen de la estructura en H4 (cruce EMA9/EMA21 +
-RSI + confluencia RCI). Esa idea queda "pendiente" hasta que M15 confirma con
-su propio cruce EMA9/EMA21 en la misma dirección — M15 solo afina el momento
-de entrada, no genera trades propios con take profit cercano. La idea
-pendiente se descarta si el precio en H4 ya tocó el stop loss calculado, si
-aparece un cruce EMA contrario en H4, o (como backstop de seguridad) si pasan
-más de PENDING_MAX_HOURS sin confirmación.
+Capas de trading: el sesgo direccional y los niveles de entrada/stop/take
+profit salen de la estructura en una temporalidad "de sesgo" — H4 para
+trades de plazo más largo, H1 para trades de plazo intermedio (agregada para
+que lleguen alertas con más frecuencia, sin bajar a M15 standalone: entrar
+en 15 min con take profit cerca queda descartado a propósito). Cada sesgo
+queda "pendiente" hasta que M15 confirma con su propio cruce EMA9/EMA21 en
+la misma dirección — M15 solo afina el momento de entrada, no genera trades
+propios. La idea pendiente se descarta si el precio en la temporalidad de
+sesgo ya tocó el stop loss calculado, si aparece un cruce EMA contrario, o
+(como backstop de seguridad) si pasa más tiempo del configurado sin
+confirmación — medido contra el reloj real, no contra la última vela
+cerrada (eso retrasaba el backstop hasta el doble del límite si coincidía
+con el borde de una vela).
 
 Capa de tendencia: avisos de cambio de régimen en Diario y Semanal (ver más
-abajo), independientes de la capa de trading.
+abajo), independientes de las capas de trading.
+
+Gestión de riesgo: cada señal de trading trae una sugerencia de tamaño de
+posición según la regla del 2% (Elder, Muñoz) expresada como múltiplo de tu
+capital, con ajuste anti-martingala según pérdidas ya cerradas ese día en
+la bitácora.
+
+Interacción por Telegram: además de recibir alertas, se puede mandar
+"/estado" en cualquier momento para saber si el bot sigue en línea, y
+responder con los botones "Tomé el trade" / "No lo tomé" en cada señal de
+trading para que quede registrado en la bitácora. Estas respuestas se
+procesan sondeando la API de Telegram (getUpdates) en cada corrida del cron,
+así que pueden demorar hasta el intervalo del cron (~15 min) en reflejarse —
+no es instantáneo.
 
 Envía las alertas por Telegram. Diseñado para correr gratis y en tiempo real
 vía GitHub Actions (cron cada 15 minutos), pero también funciona en loop local.
@@ -24,7 +42,7 @@ Variables de entorno necesarias:
     TELEGRAM_CHAT_ID    -> tu chat_id (te lo da @userinfobot)
 
 Uso:
-    python bot_btc_h4.py            # corre una vez (revisa H4 y M15) y sale (ideal para cron/GitHub Actions)
+    python bot_btc_h4.py            # corre una vez y sale (ideal para cron/GitHub Actions)
     python bot_btc_h4.py --loop     # corre en loop continuo, revisando cada 1 minuto
 """
 
@@ -61,20 +79,30 @@ TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.j
 RISK_RULE_PCT = 2.0
 RISK_RULE_MIN_PCT = 0.5
 
-# Disparador adicional en H4 (además del cruce EMA9/21): canal de regresión
+# Disparador adicional en H4/H1 (además del cruce EMA9/21): canal de regresión
 # lineal. Solo cuenta como toque válido si además coincide con un swing
 # high/low real reciente (confluencia) — reduce falsos positivos de un canal
 # que sea solo matemática sin respaldo en la estructura real del precio.
-CHANNEL_LOOKBACK = 40             # velas H4 para ajustar la recta de regresión (~6.7 días)
+CHANNEL_LOOKBACK = 40             # velas para ajustar la recta de regresión
 CHANNEL_STD_MULT = 2.0            # ancho del canal, en desvíos estándar sobre la recta
 CHANNEL_TOUCH_TOLERANCE_ATR = 0.3 # qué tan cerca del límite cuenta como "toque"
 CHANNEL_SWING_CONFLUENCE_ATR = 1.0  # qué tan cerca debe estar el límite del canal de un swing real
 
-# Capa de trading: sesgo direccional y niveles desde H4, entrada afinada con
-# confirmación en M15 (ver docstring del módulo).
+# Capas de trading: sesgo direccional y niveles desde H4 o H1, entrada afinada
+# con confirmación en M15 (ver docstring del módulo).
 H4_CONFIG = {"label": "H4", "kraken_interval": 240}
+H1_CONFIG = {"label": "H1", "kraken_interval": 60}
 M15_CONFIG = {"label": "M15", "kraken_interval": 15}
-PENDING_MAX_HOURS = 4     # backstop de seguridad: no es el criterio principal de invalidación
+H4_PENDING_MAX_HOURS = 4     # backstop de seguridad para H4: no es el criterio principal de invalidación
+H1_PENDING_MAX_HOURS = 1.5   # ídem para H1 (vela más corta, backstop más corto)
+BIAS_KLINES_LIMIT = 150      # margen extra sobre CHANNEL_LOOKBACK/EMA_CONTEXT_SLOW para que no
+                              # falten velas después de descartar la última (aún en formación)
+
+# EMA de contexto (las más usadas junto al 50/200): puramente informativo, se
+# muestra en cada señal H4/H1 para que veas si el precio está alineado con
+# una tendencia intermedia, pero NO descarta ni filtra ninguna señal.
+EMA_CONTEXT_FAST = 50
+EMA_CONTEXT_SLOW = 100
 
 # Apalancamiento sugerido (solo informativo en la alerta, no ejecuta nada).
 # Se limita a MAX_LEVERAGE, y además se recorta si el stop loss está muy
@@ -100,11 +128,19 @@ EMA_LT_FAST = 10
 EMA_LT_SLOW = 30
 RCI_LT_PERIOD = 12
 
+# Si un check (H4c, H1c, D1_trend, W1_trend) falla esta cantidad de corridas
+# SEGUIDAS, se manda un aviso por Telegram (además de quedar en el log de
+# GitHub Actions) — evita spam por hipos de red transitorios, pero avisa si
+# algo queda roto de verdad.
+ERROR_ALERT_THRESHOLD = 3
+
 # Nota: la API de Binance (api.binance.com) devuelve error 451 (bloqueo legal
 # por región) para las IPs de los runners de GitHub Actions, así que usamos
 # la API pública de Kraken, que no tiene esa restricción.
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_GET_UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
+TELEGRAM_ANSWER_CALLBACK_URL = "https://api.telegram.org/bot{token}/answerCallbackQuery"
 
 
 def get_klines(pair="XBTUSD", interval_minutes=240, limit=100):
@@ -496,10 +532,11 @@ def detect_channel_touch(candles):
 
 def detect_h4_bias(candles):
     """
-    Combina los dos disparadores de H4: primero el cruce EMA9/21 (el original,
-    más probado); si no hay nada, prueba el toque de canal con confluencia de
-    swing. Cualquiera de los dos puede abrir una idea pendiente de confirmar
-    en M15.
+    Combina los dos disparadores de sesgo (sirve para H4 o H1, la función no
+    depende de la temporalidad, solo de las velas que le pasen): primero el
+    cruce EMA9/21 (el original, más probado); si no hay nada, prueba el
+    toque de canal con confluencia de swing. Cualquiera de los dos puede
+    abrir una idea pendiente de confirmar en M15.
     """
     signal, info = detect_signal(candles)
     if signal:
@@ -511,8 +548,8 @@ def detect_h4_bias(candles):
 def detect_m15_confirmation(candles, direction):
     """
     Confirmación de entrada en M15: mismo mecanismo de cruce EMA9/EMA21 + filtro
-    RSI que usa H4, pero acá solo sirve para afinar el momento de entrada de un
-    sesgo que ya viene definido por H4 — no genera SL/TP propios.
+    RSI que usa la temporalidad de sesgo, pero acá solo sirve para afinar el
+    momento de entrada de un sesgo ya definido — no genera SL/TP propios.
     """
     closes = [c["close"] for c in candles]
     ema_fast = calculate_ema(closes, EMA_FAST)
@@ -543,23 +580,27 @@ def detect_m15_confirmation(candles, direction):
     return False, info
 
 
-def is_bias_invalidated(pending, h4_candles):
+def is_bias_invalidated(pending, bias_candles, pending_max_hours):
     """
-    Invalida una idea de trade H4 pendiente de confirmación por indicadores, no
-    por reloj: si el precio en H4 ya tocó el stop loss calculado (la idea falló
-    sola), o si aparece un cruce EMA9/EMA21 contrario en H4 (cambió la lectura
-    de fondo). El límite de horas es solo un backstop de seguridad aparte.
+    Invalida una idea de trade pendiente de confirmación por indicadores, no
+    por reloj: si el precio en la temporalidad de sesgo ya tocó el stop loss
+    calculado (la idea falló sola), o si aparece un cruce EMA9/EMA21
+    contrario (cambió la lectura de fondo). El límite de horas es solo un
+    backstop de seguridad aparte, medido contra el reloj real (no contra la
+    última vela cerrada — usarla retrasaba el backstop hasta el doble del
+    límite si coincidía con el borde de una vela; bug detectado en
+    producción: una idea seguía "activa" a las 5.7h con backstop de 4h).
     """
-    last = h4_candles[-1]
+    last = bias_candles[-1]
     direction = pending["direction"]
     sl = pending["stop_loss"]
 
     if direction == "BUY" and last["low"] <= sl:
-        return True, "el precio en H4 ya tocó el stop loss calculado"
+        return True, "el precio ya tocó el stop loss calculado"
     if direction == "SELL" and last["high"] >= sl:
-        return True, "el precio en H4 ya tocó el stop loss calculado"
+        return True, "el precio ya tocó el stop loss calculado"
 
-    closes = [c["close"] for c in h4_candles]
+    closes = [c["close"] for c in bias_candles]
     ema_fast = calculate_ema(closes, EMA_FAST)
     ema_slow = calculate_ema(closes, EMA_SLOW)
     i = len(closes) - 1
@@ -568,19 +609,14 @@ def is_bias_invalidated(pending, h4_candles):
         crossed_up = ema_fast[prev] <= ema_slow[prev] and ema_fast[i] > ema_slow[i]
         crossed_down = ema_fast[prev] >= ema_slow[prev] and ema_fast[i] < ema_slow[i]
         if direction == "BUY" and crossed_down:
-            return True, "apareció un cruce EMA bajista en H4 (la lectura de fondo cambió)"
+            return True, "apareció un cruce EMA bajista (la lectura de fondo cambió)"
         if direction == "SELL" and crossed_up:
-            return True, "apareció un cruce EMA alcista en H4 (la lectura de fondo cambió)"
+            return True, "apareció un cruce EMA alcista (la lectura de fondo cambió)"
 
-    # Ojo: usar el reloj real (no el close_time de la última vela H4 disponible).
-    # Esa última vela solo avanza de a bloques de 4h, así que compararse contra
-    # ella puede retrasar el backstop hasta el doble del límite configurado si
-    # justo coincide con el borde de una vela (bug detectado en producción:
-    # idea pendiente seguía activa a las 5.7h en vez de cortarse a las 4h).
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    age_hours = (now_ms - pending["h4_close_time"]) / (3600 * 1000)
-    if age_hours > PENDING_MAX_HOURS:
-        return True, f"pasaron más de {PENDING_MAX_HOURS}h sin confirmación (backstop de seguridad)"
+    age_hours = (now_ms - pending["bias_close_time"]) / (3600 * 1000)
+    if age_hours > pending_max_hours:
+        return True, f"pasaron más de {pending_max_hours}h sin confirmación (backstop de seguridad)"
 
     return False, None
 
@@ -630,7 +666,22 @@ def suggest_risk_rule_pct(trades, now_ms, layer="trading", base_pct=RISK_RULE_PC
     return round(pct, 2), losses_today, round(cum_result, 2)
 
 
-def format_h4_entry_message(direction, info):
+def compute_context_ema(candles, fast_period=EMA_CONTEXT_FAST, slow_period=EMA_CONTEXT_SLOW):
+    """
+    EMA50/100 de contexto: puramente informativo. Devuelve None si todavía no
+    hay suficientes velas (no debería pasar con BIAS_KLINES_LIMIT), en cuyo
+    caso el mensaje simplemente no muestra esta línea.
+    """
+    closes = [c["close"] for c in candles]
+    ema_fast = calculate_ema(closes, fast_period)
+    ema_slow = calculate_ema(closes, slow_period)
+    i = len(closes) - 1
+    if ema_fast[i] is None or ema_slow[i] is None:
+        return None
+    return {"ema_context_fast": round(ema_fast[i], 2), "ema_context_slow": round(ema_slow[i], 2)}
+
+
+def format_bias_entry_message(direction, info, bias_label, horizon_desc):
     emoji = "🟢" if direction == "BUY" else "🔴"
     accion = "COMPRA" if direction == "BUY" else "VENTA"
 
@@ -643,7 +694,7 @@ def format_h4_entry_message(direction, info):
     confluencia = ""
     if info.get("divergence_confirms"):
         tipo = "alcista" if direction == "BUY" else "bajista"
-        confluencia = f"✅ Confirmado por divergencia {tipo} de RCI en H4\n"
+        confluencia = f"✅ Confirmado por divergencia {tipo} de RCI en {bias_label}\n"
 
     trigger_label = {
         "ema_cross": "cruce EMA9/EMA21",
@@ -652,30 +703,41 @@ def format_h4_entry_message(direction, info):
 
     canal_linea = ""
     if info.get("trigger_type") == "channel_touch":
-        canal_linea = (f"Canal H4: soporte ${info['channel_lower']:,.2f} / "
+        canal_linea = (f"Canal {bias_label}: soporte ${info['channel_lower']:,.2f} / "
                         f"resistencia ${info['channel_upper']:,.2f}\n")
 
-    ts_h4 = datetime.fromtimestamp(info["h4_close_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ts_bias = datetime.fromtimestamp(info["bias_close_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ts_m15 = datetime.fromtimestamp(info["close_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    contexto_linea = ""
+    cf, cs = info.get("ema_context_fast"), info.get("ema_context_slow")
+    if cf is not None and cs is not None:
+        alineado = (cf > cs) == (direction == "BUY")
+        estado = "a favor ✅" if alineado else "en contra ⚠️"
+        contexto_linea = (
+            f"Contexto EMA{EMA_CONTEXT_FAST}/{EMA_CONTEXT_SLOW} en {bias_label}: "
+            f"${cf:,.2f} / ${cs:,.2f} ({estado} de la señal, solo informativo)\n"
+        )
 
     gestion_linea = _format_risk_rule_section(info, riesgo_pct)
 
     return (
-        f"{emoji} *Señal de {accion} - BTC/USD (H4, confirmada en M15)*\n"
+        f"{emoji} *Señal de {accion} - BTC/USD ({bias_label}, confirmada en M15)*\n"
         f"Disparador: {trigger_label}\n"
-        f"Sesgo detectado en H4: {ts_h4}\n"
+        f"Sesgo detectado en {bias_label}: {ts_bias}\n"
         f"Confirmado en M15: {ts_m15}\n"
-        f"RSI H4: {info['rsi']} | RCI H4: {info['rci']} | ATR H4: {info['atr']:,.2f}\n"
+        f"RSI {bias_label}: {info['rsi']} | RCI {bias_label}: {info['rci']} | ATR {bias_label}: {info['atr']:,.2f}\n"
+        f"{contexto_linea}"
         f"{canal_linea}"
         f"{confluencia}\n"
         f"📍 Entrada (afinada en M15): ${entry:,.2f}\n"
         f"🛑 Stop loss (estructura M15, ajustado): ${sl:,.2f} (-{riesgo_pct:.2f}%)\n"
-        f"🎯 Take profit (objetivo H4): ${tp:,.2f} (+{beneficio_pct:.2f}%)\n"
+        f"🎯 Take profit (objetivo {bias_label}): ${tp:,.2f} (+{beneficio_pct:.2f}%)\n"
         f"⚖️ Ratio riesgo:beneficio real: 1:{info.get('actual_risk_reward', '?')}\n"
         f"📊 Apalancamiento sugerido: hasta {info['leverage']}x\n"
         f"{gestion_linea}\n"
-        f"_Trade de plazo más largo: la dirección y los niveles vienen de la estructura en "
-        f"H4, M15 solo afina el momento de entrada. El apalancamiento amplifica tanto "
+        f"_Trade de plazo {horizon_desc}: la dirección y los niveles vienen de la estructura en "
+        f"{bias_label}, M15 solo afina el momento de entrada. El apalancamiento amplifica tanto "
         f"ganancias como pérdidas y acerca el precio de liquidación — el valor sugerido "
         f"deja margen respecto de la distancia al stop loss, pero no elimina el riesgo de "
         f"liquidación (funding, mecha de precio, o slippage pueden variarlo). Usalo solo si "
@@ -791,9 +853,13 @@ def format_regime_message(direction, info, horizon_label, ema_fast_period, ema_s
 
 def load_state():
     """
-    "H4_pending" guarda la idea de trade H4 pendiente de confirmación en M15
-    (o {"active": False} si no hay ninguna). Las claves *_trend guardan la
-    última vela ya alertada por cada capa de tendencia, para no repetir.
+    "H4_pending"/"H1_pending" guardan la idea de trade pendiente de
+    confirmación en M15 para cada temporalidad de sesgo (o {"active": False}
+    si no hay ninguna). Las claves *_trend guardan la última vela ya alertada
+    por cada capa de tendencia, para no repetir. "checks_status" trackea
+    fallos consecutivos por check, para avisar por Telegram si algo queda
+    roto. "telegram_update_offset" es el cursor de getUpdates (botones y
+    comandos como /estado). "last_run_at" queda para poder responder /estado.
     """
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
@@ -803,8 +869,13 @@ def load_state():
 
     state.setdefault("H4_pending", {"active": False})
     state.setdefault("H4_last_bias_close_time", None)
+    state.setdefault("H1_pending", {"active": False})
+    state.setdefault("H1_last_bias_close_time", None)
     state.setdefault(TREND_TIMEFRAME["label"] + "_trend", {"last_alerted_close_time": None})
     state.setdefault(LONGTERM_TIMEFRAME["label"] + "_trend", {"last_alerted_close_time": None})
+    state.setdefault("checks_status", {})
+    state.setdefault("last_run_at", None)
+    state.setdefault("telegram_update_offset", None)
 
     return state
 
@@ -814,19 +885,159 @@ def save_state(state):
         json.dump(state, f)
 
 
-def send_telegram_message(text):
+def send_telegram_message(text, reply_markup=None):
+    """Devuelve el message_id de Telegram si se pudo mandar (o None), para poder
+    referenciarlo después (ej. guardarlo en la bitácora)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("[AVISO] Faltan TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. No se envía Telegram.")
         print(text)
-        return
+        return None
     url = TELEGRAM_API_URL.format(token=token)
-    resp = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=15)
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    resp = requests.post(url, json=payload, timeout=15)
     if resp.status_code != 200:
         print(f"[ERROR] Telegram respondió {resp.status_code}: {resp.text}")
+        return None
+    print("[OK] Alerta enviada por Telegram.")
+    return resp.json().get("result", {}).get("message_id")
+
+
+def build_trade_response_keyboard(trade_id):
+    """Botones inline "Tomé / No tomé el trade" — el callback_data lleva el id
+    del trade para poder correlacionarlo directo con la bitácora."""
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Tomé el trade", "callback_data": f"take:{trade_id}"},
+            {"text": "❌ No lo tomé", "callback_data": f"skip:{trade_id}"},
+        ]]
+    }
+
+
+def get_telegram_updates(offset=None):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return []
+    url = TELEGRAM_GET_UPDATES_URL.format(token=token)
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.get(url, params=params, timeout=15)
+    if resp.status_code != 200:
+        print(f"[ERROR] getUpdates respondió {resp.status_code}: {resp.text}")
+        return []
+    data = resp.json()
+    return data.get("result", []) if data.get("ok") else []
+
+
+def answer_telegram_callback(callback_query_id, text=None):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    url = TELEGRAM_ANSWER_CALLBACK_URL.format(token=token)
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    requests.post(url, json=payload, timeout=15)
+
+
+def build_health_status_message(state, trades):
+    """Arma la respuesta a "/estado": si el bot sigue corriendo, cuándo corrió
+    la última vez, si hay ideas pendientes, y si algún check viene fallando."""
+    last_run = state.get("last_run_at")
+    last_run_txt = (
+        datetime.fromtimestamp(last_run / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if last_run else "todavía no corrió ninguna vez"
+    )
+
+    problems = [
+        f"⚠️ {label}: {status['consecutive_failures']} fallos seguidos — último error: {status.get('last_error')}"
+        for label, status in state.get("checks_status", {}).items()
+        if status.get("consecutive_failures", 0) > 0
+    ]
+
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+
+    pending_lines = []
+    for pending_key, bias_label in (("H4_pending", "H4"), ("H1_pending", "H1")):
+        p = state.get(pending_key) or {}
+        if p.get("active"):
+            pending_lines.append(f"{bias_label}: {p['direction']} esperando confirmación en M15")
+
+    lines = [
+        "⚠️ *El bot está en línea, pero con problemas:*" if problems else "✅ *El bot está en línea y corriendo normal.*",
+        f"Última corrida: {last_run_txt}",
+        f"Trades abiertos en la bitácora: {len(open_trades)}",
+        "Ideas pendientes: " + (" | ".join(pending_lines) if pending_lines else "ninguna ahora mismo"),
+    ]
+    if problems:
+        lines.append("\n".join(problems))
+
+    return "\n".join(lines)
+
+
+def process_telegram_updates(state, trades):
+    """
+    Revisa mensajes/botones nuevos de Telegram desde la última corrida. No es
+    instantáneo: como el bot no queda escuchando todo el tiempo, la respuesta
+    puede demorar hasta el intervalo del cron (~15 min). Maneja:
+    - "/estado" (o "/status"): responde con un resumen de si el bot está bien.
+    - Botones "Tomé/No tomé el trade": marca la respuesta en la bitácora.
+    """
+    offset = state.get("telegram_update_offset")
+    updates = get_telegram_updates(offset)
+
+    for update in updates:
+        state["telegram_update_offset"] = update["update_id"] + 1
+
+        callback = update.get("callback_query")
+        if callback:
+            data = callback.get("data", "")
+            action, _, trade_id = data.partition(":")
+            trade = next((t for t in trades if t.get("id") == trade_id), None)
+            if trade and action in ("take", "skip"):
+                trade["user_response"] = "tomado" if action == "take" else "no_tomado"
+                ack = "👍 Anotado: tomaste el trade." if action == "take" else "👌 Anotado: no lo tomaste."
+                answer_telegram_callback(callback["id"], text=ack)
+                print(f"[TELEGRAM] Respuesta registrada en trade {trade_id}: {trade['user_response']}")
+            else:
+                answer_telegram_callback(callback["id"])
+            continue
+
+        message = update.get("message") or {}
+        text = (message.get("text") or "").strip().lower()
+        if text in ("/estado", "/status"):
+            send_telegram_message(build_health_status_message(state, trades))
+
+
+def record_check_result(state, label, error=None):
+    """
+    Trackea fallos consecutivos por check. Si un check falla ERROR_ALERT_THRESHOLD
+    veces seguidas, manda un aviso por Telegram (una sola vez, no en cada corrida
+    mientras siga fallando) — así te enterás de un problema real sin depender del
+    mail de GitHub Actions. Si se recupera después de haber alertado, también avisa.
+    """
+    status = state["checks_status"].setdefault(
+        label, {"consecutive_failures": 0, "last_error": None, "alerted": False})
+
+    if error is None:
+        if status["alerted"]:
+            send_telegram_message(f"✅ *{label}* se recuperó, ya está funcionando de nuevo.")
+        status["consecutive_failures"] = 0
+        status["last_error"] = None
+        status["alerted"] = False
     else:
-        print("[OK] Alerta enviada por Telegram.")
+        status["consecutive_failures"] += 1
+        status["last_error"] = str(error)
+        if status["consecutive_failures"] >= ERROR_ALERT_THRESHOLD and not status["alerted"]:
+            send_telegram_message(
+                f"⚠️ *{label}* falló {status['consecutive_failures']} veces seguidas.\n"
+                f"Último error: {error}\n\nRevisá el log en GitHub Actions."
+            )
+            status["alerted"] = True
 
 
 def load_trades():
@@ -846,7 +1057,7 @@ def log_trade(trades, layer, timeframe_label, direction, info):
     usuario la toma o no — así se puede medir la efectividad real del bot."""
     trade = {
         "id": f"{timeframe_label}-{direction}-{info['close_time']}",
-        "layer": layer,  # "trading" (M15/H4) | "trend" (D1/W1)
+        "layer": layer,  # "trading" (H4c/H1c) | "trend" (D1/W1)
         "timeframe": timeframe_label,
         "direction": direction,
         "entry": info.get("entry"),
@@ -863,8 +1074,8 @@ def log_trade(trades, layer, timeframe_label, direction, info):
             "atr": info.get("atr"),
             "divergence": info.get("divergence"),
         },
-        "user_response": None,          # se completa en la Etapa E (botones Telegram)
-        "telegram_message_id": None,    # idem
+        "user_response": None,          # "tomado" / "no_tomado", vía botones de Telegram
+        "telegram_message_id": None,    # se completa después de mandar el mensaje
     }
     trades.append(trade)
     return trade
@@ -919,25 +1130,27 @@ def update_open_trades(trades, timeframe_label, candles):
             print(f"[BITÁCORA] Trade {t['id']} cerrado: {t['status']} ({t['result_pct']}%)")
 
 
-def check_h4_entry(state, trades):
+def check_bias_entry(state, trades, bias_cfg, horizon_desc, pending_key, last_bias_key, pending_max_hours):
     """
-    Capa de trading: sesgo direccional desde H4, entrada afinada con
-    confirmación en M15. Ver docstring del módulo para el detalle completo.
+    Capa de trading genérica: sesgo direccional desde `bias_cfg` (H4 o H1),
+    entrada afinada con confirmación en M15. Ver docstring del módulo.
     """
-    label = "H4c"  # H4 confirmado en M15
-    h4_candles = only_closed_candles(get_klines(interval_minutes=H4_CONFIG["kraken_interval"], limit=100))
+    bias_label = bias_cfg["label"]
+    label = bias_label + "c"  # ej. "H4c", "H1c" -> temporalidad de sesgo confirmada en M15
+    bias_candles = only_closed_candles(
+        get_klines(interval_minutes=bias_cfg["kraken_interval"], limit=BIAS_KLINES_LIMIT))
 
-    update_open_trades(trades, label, h4_candles)
+    update_open_trades(trades, label, bias_candles)
 
-    pending = state.get("H4_pending") or {"active": False}
+    pending = state.get(pending_key) or {"active": False}
 
     if pending.get("active"):
-        invalidated, reason = is_bias_invalidated(pending, h4_candles)
+        invalidated, reason = is_bias_invalidated(pending, bias_candles, pending_max_hours)
 
         if invalidated:
             print(f"[{label}] Idea de {pending['direction']} descartada: {reason}")
             pending = {"active": False}
-            state["H4_pending"] = pending
+            state[pending_key] = pending
         else:
             m15_candles = only_closed_candles(get_klines(interval_minutes=M15_CONFIG["kraken_interval"], limit=100))
             confirmed, m15_info = detect_m15_confirmation(m15_candles, pending["direction"])
@@ -947,8 +1160,7 @@ def check_h4_entry(state, trades):
                 entry_final = m15_info["price"]
 
                 # Stop ajustado en M15 (más cerca de la entrada), take profit proyectado
-                # desde H4 (el objetivo grande, sin recalcular). Esto es lo que pediste:
-                # bajar el % de riesgo sin resignar el objetivo de plazo más largo.
+                # desde la temporalidad de sesgo (el objetivo grande, sin recalcular).
                 i_m15 = len(m15_candles) - 1
                 atr_m15 = calculate_atr(m15_candles, ATR_PERIOD)[i_m15]
                 m15_levels = calculate_trade_levels(m15_candles, i_m15, entry_final, atr_m15, direction)
@@ -986,28 +1198,35 @@ def check_h4_entry(state, trades):
                         "cum_result_today": cum_result_today,
                     })
 
-                    message = format_h4_entry_message(direction, full_info)
-                    send_telegram_message(message)
-                    log_trade(trades, "trading", label, direction, full_info)
+                    context = compute_context_ema(bias_candles)
+                    if context:
+                        full_info.update(context)
+
+                    # Se registra en la bitácora ANTES de mandar el mensaje, para poder
+                    # incluir el id del trade en los botones "Tomé/No tomé el trade".
+                    trade = log_trade(trades, "trading", label, direction, full_info)
+                    message = format_bias_entry_message(direction, full_info, bias_label, horizon_desc)
+                    message_id = send_telegram_message(message, reply_markup=build_trade_response_keyboard(trade["id"]))
+                    trade["telegram_message_id"] = message_id
 
                     pending = {"active": False}
-                    state["H4_pending"] = pending
+                    state[pending_key] = pending
 
             if pending.get("active"):
-                print(f"[{label}] Sesgo {pending['direction']} en H4 activo, esperando "
+                print(f"[{label}] Sesgo {pending['direction']} en {bias_label} activo, esperando "
                       f"confirmación en M15 (RSI M15={m15_info.get('rsi')}).")
 
     if not pending.get("active"):
-        signal, info = detect_h4_bias(h4_candles)
-        already_used = info.get("close_time") == state.get("H4_last_bias_close_time")
+        signal, info = detect_h4_bias(bias_candles)
+        already_used = info.get("close_time") == state.get(last_bias_key)
         if signal and not already_used:
-            state["H4_pending"] = {
+            state[pending_key] = {
                 "active": True,
                 "direction": signal,
                 "trigger_type": info.get("trigger_type", "ema_cross"),
-                "h4_close_time": info["close_time"],
-                "stop_loss": info["stop_loss"],       # referencia H4, usada para invalidar la idea
-                "take_profit": info["take_profit"],   # objetivo H4, se mantiene sin recalcular
+                "bias_close_time": info["close_time"],
+                "stop_loss": info["stop_loss"],       # referencia de sesgo, usada para invalidar la idea
+                "take_profit": info["take_profit"],   # objetivo de sesgo, se mantiene sin recalcular
                 "rsi": info["rsi"],
                 "rci": info["rci"],
                 "atr": info["atr"],
@@ -1016,15 +1235,28 @@ def check_h4_entry(state, trades):
                 "channel_upper": info.get("channel_upper"),
                 "channel_lower": info.get("channel_lower"),
             }
-            state["H4_last_bias_close_time"] = info["close_time"]
-            print(f"[{label}] Nueva idea de {signal} en H4 ({info.get('trigger_type')}), "
+            state[last_bias_key] = info["close_time"]
+            print(f"[{label}] Nueva idea de {signal} en {bias_label} ({info.get('trigger_type')}), "
                   f"esperando confirmación en M15.")
         elif signal and already_used:
-            print(f"[{label}] La vela H4 ya generó una idea antes (confirmada o descartada), "
+            print(f"[{label}] La vela {bias_label} ya generó una idea antes (confirmada o descartada), "
                   f"no se repite hasta la próxima vela.")
         else:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] [{label}] Sin sesgo nuevo en H4. "
+            print(f"[{datetime.now(timezone.utc).isoformat()}] [{label}] Sin sesgo nuevo en {bias_label}. "
                   f"RSI={info.get('rsi')} EMA9={info.get('ema_fast')} EMA21={info.get('ema_slow')}")
+
+
+def check_h4_entry(state, trades):
+    """Trade de plazo más largo: sesgo en H4, confirmación en M15."""
+    check_bias_entry(state, trades, H4_CONFIG, "más largo", "H4_pending",
+                      "H4_last_bias_close_time", H4_PENDING_MAX_HOURS)
+
+
+def check_h1_entry(state, trades):
+    """Trade de plazo intermedio: sesgo en H1, confirmación en M15. Agregado
+    para que lleguen alertas con más frecuencia que solo con H4."""
+    check_bias_entry(state, trades, H1_CONFIG, "intermedio", "H1_pending",
+                      "H1_last_bias_close_time", H1_PENDING_MAX_HOURS)
 
 
 def check_regime_change(state, trades, timeframe_cfg, ema_fast_period, ema_slow_period, rci_period,
@@ -1068,35 +1300,119 @@ def run_once():
     trades = load_trades()
 
     try:
-        check_h4_entry(state, trades)
+        process_telegram_updates(state, trades)
     except Exception as e:
-        print(f"[ERROR] [H4c] {e}")
+        print(f"[ERROR] [telegram_updates] {e}")
 
-    try:
-        check_regime_change(
+    checks = [
+        ("H4c", lambda: check_h4_entry(state, trades)),
+        ("H1c", lambda: check_h1_entry(state, trades)),
+        ("D1_trend", lambda: check_regime_change(
             state, trades, TREND_TIMEFRAME, EMA_TREND_FAST, EMA_TREND_SLOW, RCI_TREND_PERIOD,
             horizon_label="Diario",
             note=("Aviso de cambio de régimen de mercado de fondo (poco frecuente, no es una "
-                  "entrada inmediata como M15/H4). Útil para decidir si conviene operar a favor "
+                  "entrada inmediata como M15/H1/H4). Útil para decidir si conviene operar a favor "
                   "o en contra de la tendencia mayor."),
-        )
-    except Exception as e:
-        print(f"[ERROR] [D1_trend] {e}")
-
-    try:
-        check_regime_change(
+        )),
+        ("W1_trend", lambda: check_regime_change(
             state, trades, LONGTERM_TIMEFRAME, EMA_LT_FAST, EMA_LT_SLOW, RCI_LT_PERIOD,
             horizon_label="Semanal — visión de largo plazo",
             note=("Visión de largo plazo (meses/años), pensada para decisiones de inversión, no "
                   "de trading. Kraken no ofrece velas mensuales nativas, así que se usa la "
                   "Semanal como la temporalidad práctica más larga disponible."),
             klines_limit=500,
-        )
-    except Exception as e:
-        print(f"[ERROR] [W1_trend] {e}")
+        )),
+    ]
+
+    for label, fn in checks:
+        try:
+            fn()
+            record_check_result(state, label)
+        except Exception as e:
+            print(f"[ERROR] [{label}] {e}")
+            record_check_result(state, label, error=e)
+
+    state["last_run_at"] = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     save_state(state)
     save_trades(trades)
+
+
+def compute_bitacora_stats(trades, layer_filter=None, since_ms=None):
+    """
+    Resumen de la bitácora: cantidad de señales, winrate sobre las cerradas,
+    resultado acumulado, y cuántas señales tomaste vos según los botones de
+    Telegram. `since_ms` filtra por fecha de apertura (para "última semana"),
+    dejarlo en None para el histórico completo.
+    """
+    filtered = [t for t in trades if layer_filter is None or t.get("layer") == layer_filter]
+    if since_ms is not None:
+        filtered = [t for t in filtered if (t.get("opened_at") or 0) >= since_ms]
+
+    wins = [t for t in filtered if t.get("status") == "WIN"]
+    losses = [t for t in filtered if t.get("status") == "LOSS"]
+    open_trades = [t for t in filtered if t.get("status") == "OPEN"]
+    closed = wins + losses
+    winrate = (len(wins) / len(closed) * 100) if closed else None
+    cum_result = sum(t.get("result_pct") or 0 for t in closed)
+    taken = [t for t in filtered if t.get("user_response") == "tomado"]
+
+    return {
+        "total": len(filtered),
+        "wins": len(wins),
+        "losses": len(losses),
+        "open": len(open_trades),
+        "winrate": winrate,
+        "cum_result": round(cum_result, 2),
+        "taken": len(taken),
+    }
+
+
+def _format_bitacora_stats_line(stats):
+    wr = f"{stats['winrate']:.0f}%" if stats["winrate"] is not None else "s/d"
+    return (f"{stats['total']} señales | {stats['wins']}W-{stats['losses']}L "
+            f"({wr} winrate) | {stats['open']} abiertas | "
+            f"resultado acumulado: {stats['cum_result']:+.2f}% | "
+            f"tomadas por vos: {stats['taken']}")
+
+
+def format_weekly_report(trades, now_ms):
+    """
+    Reporte semanal de la capa de trading (H4c/H1c): resumen de los últimos 7
+    días y el histórico completo, para poder juzgar la efectividad real sin
+    depender de revisar trades.json a mano. La capa de tendencia (D1/W1) no
+    entra acá — son avisos muy poco frecuentes, no tiene sentido un reporte
+    semanal para eso.
+    """
+    since_week = now_ms - 7 * 24 * 3600 * 1000
+    week = compute_bitacora_stats(trades, layer_filter="trading", since_ms=since_week)
+    overall = compute_bitacora_stats(trades, layer_filter="trading")
+
+    lines = [
+        "📊 *Reporte semanal — bot BTC (capa de trading H4/H1)*",
+        "",
+        f"Últimos 7 días: {_format_bitacora_stats_line(week)}",
+        f"Histórico completo: {_format_bitacora_stats_line(overall)}",
+        "",
+    ]
+
+    if overall["total"] < 20:
+        lines.append(
+            f"Todavía es poca muestra ({overall['total']} señales en total) para sacar "
+            f"conclusiones estadísticas confiables — seguimos acumulando datos antes de "
+            f"pensar en plata real."
+        )
+
+    lines.append("\n_Reporte automático generado desde la bitácora. No es consejo financiero._")
+    return "\n".join(lines)
+
+
+def send_weekly_report():
+    """Manda el reporte semanal por Telegram. Pensado para correr desde un
+    workflow de GitHub Actions aparte, con su propio cron semanal."""
+    trades = load_trades()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    send_telegram_message(format_weekly_report(trades, now_ms))
 
 
 def test_telegram():
@@ -1104,7 +1420,7 @@ def test_telegram():
     para verificar que el token/chat_id están bien configurados."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     send_telegram_message(
-        f"✅ *Test de conexión* — el bot de alertas BTC (H4/M15) está andando bien.\n"
+        f"✅ *Test de conexión* — el bot de alertas BTC (H4/H1/M15) está andando bien.\n"
         f"Hora: {ts}"
     )
 
@@ -1113,10 +1429,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", action="store_true", help="Correr en loop continuo (revisa cada 1 min)")
     parser.add_argument("--test-telegram", action="store_true", help="Manda un mensaje de prueba y sale, sin chequear señales")
+    parser.add_argument("--weekly-report", action="store_true", help="Manda el reporte semanal de la bitácora y sale")
     args = parser.parse_args()
 
     if args.test_telegram:
         test_telegram()
+    elif args.weekly_report:
+        send_weekly_report()
     elif args.loop:
         print("Bot corriendo en loop. Ctrl+C para detener.")
         while True:
